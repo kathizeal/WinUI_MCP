@@ -207,9 +207,14 @@ public static class WinUI3Tools
 
         Thread.Sleep(2000);
         var window = FindNewWindow(TimeSpan.FromSeconds(10), before);
+
+        // Fallback: FindNewWindow might miss if the app was already running or launched slowly
         if (window == null)
-            return $"Launched AUMID '{aumid}' but window not detected.\n" +
-                   "Call AttachToApp(title) or ListWindows() to find it manually.";
+            window = FindWindowByPackageFamilyName(pfn);
+
+        if (window == null)
+            return $"Launched AUMID '{aumid}' but window not detected after 12s.\n" +
+                   "The app may still be starting — try AttachToApp(title, processName=) or ListWindows().";
 
         _currentWindow = window;
         _currentHandle = $"w{++_windowCounter}";
@@ -288,12 +293,11 @@ public static class WinUI3Tools
                 var hwnd = w.Properties.NativeWindowHandle.ValueOrDefault;
                 if (existingHandles.Contains(hwnd)) continue;
 
-                // Skip explorer.exe windows — it's the launcher, not the target app
                 try
                 {
-                    var pid = w.Properties.ProcessId.ValueOrDefault;
+                    var pid   = w.Properties.ProcessId.ValueOrDefault;
                     var pName = System.Diagnostics.Process.GetProcessById(pid).ProcessName;
-                    if (pName.Equals("explorer", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (IsIdeProcess(pName)) continue;
                 }
                 catch { }
 
@@ -662,9 +666,10 @@ public static class WinUI3Tools
 
                 try
                 {
-                    var pid = w.Properties.ProcessId.ValueOrDefault;
-                    var proc = System.Diagnostics.Process.GetProcessById(pid).ProcessName;
-                    sb.AppendLine($"  \"{title}\" [{proc}]");
+                    var pid   = w.Properties.ProcessId.ValueOrDefault;
+                    var proc  = System.Diagnostics.Process.GetProcessById(pid).ProcessName;
+                    var isIde = IsIdeProcess(proc) ? " [IDE]" : "";
+                    sb.AppendLine($"  \"{title}\" [process={proc} pid={pid}]{isIde}");
                 }
                 catch
                 {
@@ -706,57 +711,123 @@ public static class WinUI3Tools
     // 11. ATTACH TO RUNNING APP
     // -------------------------------------------------------------------------
 
+    // Well-known IDE/shell processes whose windows must never be mistaken for a target app
+    private static readonly HashSet<string> KnownIdeProcesses = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Code", "Code - Insiders", "devenv", "rider", "idea64", "studio64",
+        "AndroidStudio", "fleet", "notepad", "notepad++", "sublime_text",
+        "explorer", "SearchHost", "StartMenuExperienceHost", "ShellExperienceHost",
+        "ApplicationFrameHost"
+    };
+
     [McpServerTool, Description(
-        "Attach to an already-running application by process name or window title. " +
-        "Use this when the app was started outside of LaunchApp (e.g. via F5 in VS, " +
-        "Start-Process, or a deploy task). Partial match, case-insensitive.")]
+        "Attach to an already-running application window. " +
+        "Use this when the app was started outside of LaunchApp (e.g. via VS F5, Start-Process). " +
+        "Matching priority: (1) exact title, (2) exact process name, (3) partial title/process " +
+        "excluding known IDEs. IDE windows (VS Code, devenv, etc.) are always skipped. " +
+        "Supply processName to disambiguate when multiple windows share a title word.")]
     public static string AttachToApp(
-        [Description("Process name (e.g. 'Raptor') or window title (e.g. 'Raptor') — partial match OK")]
-        string nameOrTitle)
+        [Description("Window title to match. Prefix with 'regex:' for a regex pattern, e.g. 'regex:^Raptor$' for exact.")]
+        string title,
+        [Description("Optional: process name filter (e.g. 'Raptor'). Narrows the search when title alone is ambiguous.")]
+        string processName = "")
     {
         try
         {
             var desktop = Automation.GetDesktop();
             var windows = desktop.FindAllChildren(cf => cf.ByControlType(ControlType.Window));
-            var search = nameOrTitle.ToLowerInvariant();
 
-            Window? match = null;
-            string? matchedBy = null;
+            // Collect all candidates with their match quality
+            var candidates = new List<(Window win, string procName, int quality, string reason)>();
+            bool useRegex  = title.StartsWith("regex:", StringComparison.OrdinalIgnoreCase);
+            var pattern    = useRegex ? title[6..] : "";
+            var searchLo   = title.ToLowerInvariant();
+            var procFilter = processName.ToLowerInvariant();
 
             foreach (var w in windows)
             {
-                var win = w.AsWindow();
+                Window? win;
+                try { win = w.AsWindow(); } catch { continue; }
                 if (win == null) continue;
 
-                var title = win.Title ?? "";
-                if (title.ToLowerInvariant().Contains(search))
-                {
-                    match = win;
-                    matchedBy = $"title \"{title}\"";
-                    break;
-                }
-
+                string pName = "";
+                int    pid   = 0;
                 try
                 {
-                    var pid = w.Properties.ProcessId.ValueOrDefault;
-                    var proc = System.Diagnostics.Process.GetProcessById(pid);
-                    if (proc.ProcessName.ToLowerInvariant().Contains(search))
-                    {
-                        match = win;
-                        matchedBy = $"process \"{proc.ProcessName}\" (pid {pid})";
-                        break;
-                    }
+                    pid   = w.Properties.ProcessId.ValueOrDefault;
+                    pName = System.Diagnostics.Process.GetProcessById(pid).ProcessName;
                 }
                 catch { }
+
+                // Apply processName filter early
+                if (!string.IsNullOrEmpty(procFilter) &&
+                    !pName.ToLowerInvariant().Contains(procFilter)) continue;
+
+                var winTitle = win.Title ?? "";
+
+                // quality: 3=exact title, 2=exact proc name, 1=partial title, 0=partial proc
+                int quality = 0;
+                string reason = "";
+
+                if (useRegex)
+                {
+                    if (!Regex.IsMatch(winTitle, pattern, RegexOptions.IgnoreCase)) continue;
+                    quality = 3; reason = $"regex match on title \"{winTitle}\"";
+                }
+                else if (winTitle.Equals(title, StringComparison.OrdinalIgnoreCase))
+                {
+                    quality = 3; reason = $"exact title \"{winTitle}\"";
+                }
+                else if (pName.Equals(title, StringComparison.OrdinalIgnoreCase))
+                {
+                    quality = 2; reason = $"exact process \"{pName}\" (pid {pid})";
+                }
+                else if (winTitle.Contains(searchLo, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Skip IDE windows for partial matches
+                    if (IsIdeProcess(pName)) continue;
+                    quality = 1; reason = $"partial title \"{winTitle}\"";
+                }
+                else if (pName.Contains(searchLo, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (IsIdeProcess(pName)) continue;
+                    quality = 0; reason = $"partial process \"{pName}\" (pid {pid})";
+                }
+                else continue;
+
+                candidates.Add((win, pName, quality, reason));
             }
 
-            if (match == null)
-                return $"No window found matching '{nameOrTitle}'.\n" +
-                       "Call ListWindows() to see all open windows.";
+            if (candidates.Count == 0)
+                return $"No window found matching title='{title}'" +
+                       (string.IsNullOrEmpty(processName) ? "" : $" processName='{processName}'") +
+                       ".\nTip: call ListWindows() to see all open windows, or use 'regex:^Raptor$' for exact match.";
 
-            _currentWindow = match;
+            // Pick best match (highest quality; on tie prefer shorter title = less noise)
+            var best = candidates
+                .OrderByDescending(c => c.quality)
+                .ThenBy(c => c.win.Title?.Length ?? 999)
+                .First();
+
+            if (candidates.Count > 1)
+            {
+                var others = string.Join(", ", candidates
+                    .Where(c => c != best)
+                    .Select(c => $"\"{c.win.Title}\" [{c.procName}]"));
+                // Only warn if there were lower-quality or same-quality alternatives
+                var msg = candidates.Any(c => c.quality == best.quality && c != best)
+                    ? $"⚠️ Multiple windows matched — picked best: \"{best.win.Title}\" [{best.procName}].\n" +
+                      $"Others: {others}\nUse processName= or 'regex:^exact$' to be precise.\n"
+                    : "";
+                _currentWindow = best.win;
+                _currentHandle = $"w{++_windowCounter}";
+                return $"{msg}Attached to '{_currentWindow.Title}' via {best.reason} — handle: {_currentHandle}\n" +
+                       "Next: call GetSnapshot to see the accessibility tree.";
+            }
+
+            _currentWindow = best.win;
             _currentHandle = $"w{++_windowCounter}";
-            return $"Attached to '{_currentWindow.Title}' via {matchedBy} — handle: {_currentHandle}\n" +
+            return $"Attached to '{_currentWindow.Title}' via {best.reason} — handle: {_currentHandle}\n" +
                    "Next: call GetSnapshot to see the accessibility tree.";
         }
         catch (Exception ex)
@@ -764,6 +835,11 @@ public static class WinUI3Tools
             return $"ERROR in AttachToApp: {ex.Message}";
         }
     }
+
+    private static bool IsIdeProcess(string procName) =>
+        KnownIdeProcesses.Contains(procName) ||
+        procName.StartsWith("Code", StringComparison.OrdinalIgnoreCase) ||
+        procName.StartsWith("devenv", StringComparison.OrdinalIgnoreCase);
 
     // -------------------------------------------------------------------------
     // 12. DEPLOY APP
