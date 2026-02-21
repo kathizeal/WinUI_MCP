@@ -118,7 +118,7 @@ Z:\openCode contribution\
 
 ## MCP Tools Reference
 
-The server exposes **8 tools** to the AI agent:
+The server exposes **19 tools** to the AI agent:
 
 ### `LaunchApp`
 Launches your WinUI 3 application.
@@ -438,6 +438,73 @@ MIT — free to use, modify, and contribute.
 - [OpenCode Docs](https://opencode.ai/docs)
 - [WinUI 3 Documentation](https://learn.microsoft.com/en-us/windows/apps/winui/winui3/)
 - [Windows UI Automation Overview](https://learn.microsoft.com/en-us/dotnet/framework/ui-automation/ui-automation-overview)
-- [Appium .NET Client](https://github.com/appium/dotnet-client)
-"# WinUI_MCP" 
-"# WinUI_MCP" 
+- [Figma REST API](https://www.figma.com/developers/api)
+
+---
+
+## Figma → WinUI 3 Workflow
+
+You can point the agent at a Figma design and have it implement the UI directly in your XAML.
+
+### One-time setup — Figma API token
+
+Generate a personal access token at **figma.com → Settings → Personal access tokens**, then set it as an environment variable so you never have to pass it per-call:
+
+```powershell
+# In your shell / VS Code terminal (or add to system env vars)
+$env:FIGMA_TOKEN = "figd_xxxxxxxxxxxxxxxxxxxx"
+```
+
+### Step 1 — Discover frames in the file
+
+```
+Use ListFigmaFrames("https://www.figma.com/design/ABC123/MyApp") to show me
+all pages and frame node IDs in this file.
+```
+
+The tool returns every page and frame with a ready-to-use `ReadFigmaDesign(...)` call.
+
+### Step 2 — Read the design
+
+```
+Use ReadFigmaDesign("https://www.figma.com/design/ABC123/MyApp?node-id=12-34")
+to extract the design tokens and show me the rendered frame.
+```
+
+The tool returns:
+- **Inline PNG** of the frame — the vision model sees the design directly
+- **Design tokens** mapped to WinUI3 XAML property names:
+  - `Background="#1E1E2E"`, `Foreground="#CDD6F4"`
+  - `FontFamily="Inter"  FontSize="14"  FontWeight="SemiBold"`
+  - `CornerRadius="8"`, `Padding="16,12,16,12"`, `Spacing="8"`
+  - `Layout: StackPanel Orientation="Vertical"`
+  - `BorderBrush="#313244"  BorderThickness="1"`
+
+### Step 3 — Implement and verify
+
+```
+Now implement this design in Z:\source\MyApp\MainWindow.xaml, then call
+BuildDeployLaunch("Z:\source\MyApp\MyApp.csproj") and compare the result
+with CompareScreenshot to check how close it is.
+```
+
+The full loop is:
+
+```
+ListFigmaFrames → ReadFigmaDesign → edit XAML → BuildDeployLaunch → CompareScreenshot
+```
+
+### Example prompt (all-in-one)
+
+```
+I have a Figma design at https://www.figma.com/design/ABC123/MyApp?node-id=12-34
+and a WinUI 3 project at Z:\source\MyApp\MyApp.csproj.
+
+Please:
+1. Read the Figma design and show me what it looks like
+2. Open Z:\source\MyApp\MainWindow.xaml
+3. Apply the colors, typography, layout, and spacing from the Figma design
+4. Build, deploy, and launch the app with BuildDeployLaunch
+5. Take a screenshot and compare it with CompareScreenshot
+6. Iterate until the result matches the design
+``` 
